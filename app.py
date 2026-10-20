@@ -1,3 +1,4 @@
+import hmac
 import os
 import random
 import re
@@ -15,6 +16,13 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 DB_FILE = os.environ.get("DB_FILE", "links.db")
 
+# STATS_KEY is the secret password for the /stats page.
+# If you don't set it, the stats page stays switched off.
+STATS_KEY = os.environ.get("STATS_KEY", "")
+
+# Short codes that would clash with our own pages
+RESERVED_CODES = {"stats"}
+
 if DATABASE_URL:
     import psycopg2
 
@@ -22,19 +30,42 @@ if DATABASE_URL:
 else:
     PLACEHOLDER = "?"  # SQLite marks values with ?
 
+_schema_ready = False  # we only need to prepare the table once per app start
+
 
 def get_db():
-    # Open a connection and make sure the two-column table exists
+    # Open a connection. The first time, also make sure the table is ready.
+    global _schema_ready
     if DATABASE_URL:
         db = psycopg2.connect(DATABASE_URL)
     else:
         db = sqlite3.connect(DB_FILE)
-    cur = db.cursor()
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS links ("
-        "short_code TEXT PRIMARY KEY, original_link TEXT NOT NULL)"
-    )
-    db.commit()
+
+    if not _schema_ready:
+        cur = db.cursor()
+        # Brand-new databases get the table with the clicks column included
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS links ("
+            "short_code TEXT PRIMARY KEY, "
+            "original_link TEXT NOT NULL, "
+            "clicks INTEGER NOT NULL DEFAULT 0)"
+        )
+        # Databases made before the click counter existed need the column added.
+        # Existing links are kept, and their click count starts at 0.
+        if DATABASE_URL:
+            cur.execute(
+                "ALTER TABLE links ADD COLUMN IF NOT EXISTS "
+                "clicks INTEGER NOT NULL DEFAULT 0"
+            )
+        else:
+            try:
+                cur.execute(
+                    "ALTER TABLE links ADD COLUMN clicks INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists, nothing to do
+        db.commit()
+        _schema_ready = True
     return db
 
 
@@ -54,17 +85,42 @@ def save_link(short_code, original_link):
     return saved
 
 
-def find_link(short_code):
-    # Look up a code (exact match only). Returns the long link, or None.
+def visit_link(short_code):
+    # Someone visited a short link: add 1 to its click count, then return the
+    # long link. Returns None if the code doesn't exist (exact match only).
     db = get_db()
     cur = db.cursor()
+    cur.execute(
+        f"UPDATE links SET clicks = clicks + 1 WHERE short_code = {PLACEHOLDER}",
+        (short_code,),
+    )
+    if cur.rowcount == 0:
+        db.close()
+        return None
     cur.execute(
         f"SELECT original_link FROM links WHERE short_code = {PLACEHOLDER}",
         (short_code,),
     )
-    row = cur.fetchone()
+    original_link = cur.fetchone()[0]
+    db.commit()
     db.close()
-    return row[0] if row else None
+    return original_link
+
+
+def get_stats():
+    # The 100 most-clicked links, plus the total number of clicks
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        "SELECT short_code, original_link, clicks FROM links "
+        "ORDER BY clicks DESC, short_code LIMIT 100"
+    )
+    rows = cur.fetchall()
+    # Total clicks across ALL links (not just the 100 shown)
+    cur.execute("SELECT COALESCE(SUM(clicks), 0) FROM links")
+    total = int(cur.fetchone()[0])
+    db.close()
+    return rows, total
 
 
 def make_random_code(length=6):
@@ -106,6 +162,39 @@ PAGE = """
 </html>
 """
 
+STATS_PAGE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Link stats</title>
+  <style>
+    body { font-family: sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ccc; vertical-align: top; }
+    td.dest { word-break: break-all; }
+    td.num, th.num { text-align: right; }
+  </style>
+</head>
+<body>
+  <h1>Link stats</h1>
+  <p>{{ rows|length }} link(s) shown, {{ total }} total click(s).</p>
+  <table>
+    <tr><th>Code</th><th>Goes to</th><th class="num">Clicks</th></tr>
+    {% for short_code, original_link, clicks in rows %}
+    <tr>
+      <td>{{ short_code }}</td>
+      <td class="dest">{{ original_link }}</td>
+      <td class="num">{{ clicks }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>
+"""
+
 NOT_FOUND_PAGE = "<h1>Link not found</h1><p><a href='/'>Make a new short link</a></p>"
 
 
@@ -132,6 +221,8 @@ def home():
             return render_template_string(
                 PAGE, error="Custom code can only use letters, numbers, - and _"
             )
+        if custom_code.lower() in RESERVED_CODES:
+            return render_template_string(PAGE, error="That code is reserved")
         short_code = custom_code
         if not save_link(short_code, original_link):
             return render_template_string(PAGE, error="That code is already taken")
@@ -146,10 +237,22 @@ def home():
     return render_template_string(PAGE, short_link=short_link)
 
 
+@app.route("/stats")
+def stats():
+    # Open it like this:  https://your-app.onrender.com/stats?key=YOUR_STATS_KEY
+    # Wrong or missing key (or no STATS_KEY set) looks exactly like "not found".
+    given_key = request.args.get("key", "").encode("utf-8")
+    if not STATS_KEY or not hmac.compare_digest(given_key, STATS_KEY.encode("utf-8")):
+        return NOT_FOUND_PAGE, 404
+
+    rows, total = get_stats()
+    return render_template_string(STATS_PAGE, rows=rows, total=total)
+
+
 @app.route("/<short_code>")
 def follow_short_link(short_code):
-    # The browser asked for /<short_code>. Look it up (exact match only).
-    original_link = find_link(short_code)
+    # The browser asked for /<short_code>. Count the click and look it up.
+    original_link = visit_link(short_code)
 
     if original_link is None:
         return NOT_FOUND_PAGE, 404
